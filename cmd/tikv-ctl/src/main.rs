@@ -411,7 +411,6 @@ fn main() {
             prefetch_buffer_count,
             input_cache_dir,
             input_cache_capacity,
-            input_cache_max_inflight,
         } => {
             let tmp_engine =
                 TemporaryRocks::new(&cfg).expect("failed to create temp engine for writing SSTs.");
@@ -446,7 +445,6 @@ fn main() {
                 input_cache: input_cache_dir.map(|dir| compact_log::InputCacheConfig {
                     dir,
                     capacity: tikv_util::config::ReadableSize(input_cache_capacity.0),
-                    max_inflight_downloads: input_cache_max_inflight,
                 }),
             };
             let exec = compact_log::Execution {

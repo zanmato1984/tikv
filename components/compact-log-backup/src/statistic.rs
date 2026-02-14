@@ -92,6 +92,26 @@ pub struct LoadStatistic {
     pub cache_evicted_bytes: u64,
 }
 
+impl LoadStatistic {
+    pub(crate) fn merge_cache_access_stat(
+        &mut self,
+        access_stat: crate::input_cache::CacheAccessStat,
+    ) {
+        self.cache_hit += access_stat.cache_hit;
+        self.cache_miss += access_stat.cache_miss;
+        self.cache_inflight_wait += access_stat.cache_inflight_wait;
+        self.cache_evicted_files += access_stat.cache_evicted_files;
+        self.cache_evicted_bytes += access_stat.cache_evicted_bytes;
+        self.remote_read_calls += access_stat.remote_read_calls;
+        self.physical_bytes_in += access_stat.remote_read_bytes;
+    }
+
+    pub(crate) fn merge_read_part_stat(&mut self, remote_bytes_in: u64) {
+        self.remote_read_part_calls += 1;
+        self.physical_bytes_in += remote_bytes_in;
+    }
+}
+
 /// The statistic of executing a subcompaction.
 #[derive(Default, Debug, Add, AddAssign, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]

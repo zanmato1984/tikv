@@ -752,16 +752,6 @@ pub enum Cmd {
             )
         )]
         input_cache_capacity: ReadableSize,
-
-        #[structopt(
-            long = "input-cache-max-inflight",
-            default_value = "4",
-            help(
-                "limit the maximum number of concurrent whole-object downloads for the local input cache. \
-                Set to 0 to disable the limit. Only effective when --input-cache-dir is set."
-            )
-        )]
-        input_cache_max_inflight: usize,
     },
     /// Get the state of a region's RegionReadProgress.
     GetRegionReadProgress {

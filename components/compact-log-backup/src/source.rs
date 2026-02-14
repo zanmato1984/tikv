@@ -2,7 +2,7 @@
 use std::{
     pin::{Pin, pin},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use async_compression::futures::write::ZstdDecoder;
@@ -19,7 +19,11 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use txn_types::Key;
 
 use super::{statistic::LoadStatistic, util::Cooperate};
-use crate::{compaction::Input, errors::Result, input_cache::LocalObjectCache};
+use crate::{
+    compaction::Input,
+    errors::Result,
+    input_cache::LocalObjectCache,
+};
 
 /// The manager of fetching log files from remote for compacting.
 #[derive(Clone)]
@@ -73,25 +77,55 @@ impl Source {
         let ext = RetryExt::default()
             .with_fail_hook(move |_: &JustRetry<std::io::Error>| counter.inc_by(1));
 
+        // `retry_all_ext` only returns the last attempt's output. For load stats we want to
+        // accumulate across attempts (e.g. first attempt downloaded into cache but later
+        // failed during processing and retried, the "miss" should still be counted).
+        let attempt_stat = Arc::new(Mutex::new(LoadStatistic::default()));
+
         let fetch = || {
             let storage = self.inner.clone();
             let id = input.id.clone();
             let compression = input.compression;
             let cache = self.cache.clone();
+            let attempt_stat = Arc::clone(&attempt_stat);
             async move {
-                let (content, remote_bytes_in, access_stat) = match cache {
+                let content = match cache {
                     Some(cache) => {
-                        let (local_path, access_stat) =
-                            cache.get_or_fetch(storage.as_ref(), &id.name).await?;
-                        let compressed_span = read_span(&local_path, id.offset, id.length).await?;
-                        let mut content = Vec::with_capacity(id.length as _);
-                        let item = pin!(Cursor::new(&mut content));
-                        let mut decompress = decompress(compression, item)?;
-                        let mut source = Cursor::new(compressed_span);
-                        let _ = futures::io::copy(&mut source, &mut decompress).await?;
-                        decompress.flush().await?;
-                        drop(decompress);
-                        (content, access_stat.remote_read_bytes, Some(access_stat))
+                        // If the span is too large to fit in cache, avoid doing a whole-object
+                        // download and fallback to range read directly.
+                        if id.length > cache.capacity_bytes() {
+                            let mut content = Vec::with_capacity(id.length as _);
+                            let item = pin!(Cursor::new(&mut content));
+                            let mut decompress = decompress(compression, item)?;
+                            let source = storage.read_part(&id.name, id.offset, id.length);
+                            let n = futures::io::copy(source, &mut decompress).await?;
+                            {
+                                let mut st =
+                                    attempt_stat.lock().unwrap_or_else(|e| e.into_inner());
+                                st.merge_read_part_stat(n);
+                            }
+                            decompress.flush().await?;
+                            drop(decompress);
+                            content
+                        } else {
+                            let (cached, access_stat) =
+                                cache.get_or_fetch(storage.as_ref(), &id.name).await?;
+                            {
+                                let mut st =
+                                    attempt_stat.lock().unwrap_or_else(|e| e.into_inner());
+                                st.merge_cache_access_stat(access_stat);
+                            }
+                            let compressed_span =
+                                read_span(cached.path(), id.offset, id.length).await?;
+                            let mut content = Vec::with_capacity(id.length as _);
+                            let item = pin!(Cursor::new(&mut content));
+                            let mut decompress = decompress(compression, item)?;
+                            let mut source = Cursor::new(compressed_span);
+                            let _ = futures::io::copy(&mut source, &mut decompress).await?;
+                            decompress.flush().await?;
+                            drop(decompress);
+                            content
+                        }
                     }
                     None => {
                         let mut content = Vec::with_capacity(id.length as _);
@@ -99,32 +133,25 @@ impl Source {
                         let mut decompress = decompress(compression, item)?;
                         let source = storage.read_part(&id.name, id.offset, id.length);
                         let n = futures::io::copy(source, &mut decompress).await?;
+                        {
+                            let mut st = attempt_stat.lock().unwrap_or_else(|e| e.into_inner());
+                            st.merge_read_part_stat(n);
+                        }
                         decompress.flush().await?;
                         drop(decompress);
-                        (content, n, None)
+                        content
                     }
                 };
-                std::io::Result::Ok((content, remote_bytes_in, access_stat))
+                std::io::Result::Ok(content)
             }
         };
 
-        let (content, remote_bytes_in, access_stat) = retry_all_ext(fetch, ext).await?;
+        let content = retry_all_ext(fetch, ext).await?;
+        let attempt_stat = attempt_stat.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(stat) = stat.as_mut() {
-            stat.physical_bytes_in += remote_bytes_in;
+            let stat = &mut **stat;
+            *stat += attempt_stat;
             stat.error_during_downloading += error_during_downloading.get();
-            match access_stat {
-                Some(access_stat) => {
-                    stat.cache_hit += access_stat.cache_hit;
-                    stat.cache_miss += access_stat.cache_miss;
-                    stat.cache_inflight_wait += access_stat.cache_inflight_wait;
-                    stat.cache_evicted_files += access_stat.cache_evicted_files;
-                    stat.cache_evicted_bytes += access_stat.cache_evicted_bytes;
-                    stat.remote_read_calls += access_stat.remote_read_calls;
-                }
-                None => {
-                    stat.remote_read_part_calls += 1;
-                }
-            }
         }
         Ok(content)
     }
@@ -373,7 +400,7 @@ mod tests {
         let storage: Arc<CountingStorage> = Arc::new(CountingStorage::new("obj".to_owned(), obj));
         let tmp = tempdir::TempDir::new("compact-log-input-cache").unwrap();
         let cache = Arc::new(
-            LocalObjectCache::new(tmp.path().to_path_buf(), 64 * 1024 * 1024, 4)
+            LocalObjectCache::new(tmp.path().to_path_buf(), 64 * 1024 * 1024)
                 .await
                 .unwrap(),
         );
@@ -426,5 +453,25 @@ mod tests {
 
         assert_eq!(storage.reads(), 0);
         assert_eq!(storage.read_parts(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_input_cache_large_span_falls_back_to_read_part() {
+        let seg = zstd_frame(b"segment-too-large-for-cache");
+        let seg_len = seg.len() as u64;
+        let storage: Arc<CountingStorage> = Arc::new(CountingStorage::new("obj".to_owned(), seg));
+        let tmp = tempdir::TempDir::new("compact-log-input-cache").unwrap();
+        let cache = Arc::new(LocalObjectCache::new(tmp.path().to_path_buf(), 1).await.unwrap());
+        let source = Source::with_cache(storage.clone(), cache);
+
+        let input = make_input("obj", 0, seg_len);
+        let mut stat: Option<&mut LoadStatistic> = None;
+        assert_eq!(
+            source.load_remote(input, &mut stat).await.unwrap(),
+            b"segment-too-large-for-cache"
+        );
+
+        assert_eq!(storage.reads(), 0);
+        assert_eq!(storage.read_parts(), 1);
     }
 }

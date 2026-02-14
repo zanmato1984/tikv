@@ -8,7 +8,6 @@ use std::{
     borrow::Cow,
     cell::Cell,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
 };
 
@@ -163,7 +162,6 @@ impl FromStr for ShardConfigArg {
 pub struct InputCacheConfig {
     pub dir: PathBuf,
     pub capacity: ReadableSize,
-    pub max_inflight_downloads: usize,
 }
 
 /// The config for an execution of a compaction.
@@ -227,10 +225,6 @@ impl slog::KV for ExecutionConfig {
         if let Some(cache) = &self.input_cache {
             serializer.emit_str("input_cache.dir", &cache.dir.to_string_lossy())?;
             serializer.emit_u64("input_cache.capacity", cache.capacity.0)?;
-            serializer.emit_u64(
-                "input_cache.max_inflight",
-                cache.max_inflight_downloads as u64,
-            )?;
         }
 
         Ok(())
@@ -290,6 +284,7 @@ pub struct Execution<DB: SstExt = RocksEngine> {
 struct ExecuteCtx<'a, H: ExecHooks> {
     storage: &'a Arc<dyn ExternalStorage + 'static>,
     hooks: &'a mut H,
+    input_cache: Option<Arc<LocalObjectCache>>,
 }
 
 impl Execution {
@@ -328,9 +323,11 @@ impl Execution {
 
     async fn run_prepared(&self, cx: &mut ExecuteCtx<'_, impl ExecHooks>) -> Result<()> {
         let mut ext = LoadFromExt::default();
+        ext.loading_content_span = Some(trace_span!("load_meta_file_names"));
         ext.prefetch_running_count = self.cfg.prefetch_running_count as usize;
         ext.prefetch_buffer_count = self.cfg.prefetch_buffer_count as usize;
 
+        let input_cache = cx.input_cache.clone();
         let ExecuteCtx {
             ref storage,
             ref mut hooks,
@@ -343,31 +340,6 @@ impl Execution {
             this: self,
         };
         hooks.before_execution_started(cx).await?;
-
-        let input_cache = match &self.cfg.input_cache {
-            Some(cfg) => {
-                let cache = LocalObjectCache::new(
-                    cfg.dir.clone(),
-                    cfg.capacity.0,
-                    cfg.max_inflight_downloads,
-                )
-                .await?;
-                tikv_util::info!(
-                    "Input cache enabled.";
-                    "dir" => %cache.dir().display(),
-                    "capacity" => cfg.capacity.0,
-                    "max_inflight" => cfg.max_inflight_downloads
-                );
-                Some(Arc::new(cache))
-            }
-            None => None,
-        };
-
-        // Avoid setting an explicit parent here: this span may be dropped while
-        // the parent span is not currently entered (e.g. early-abort paths),
-        // which can violate invariants of `tracing-active-tree`.
-        ext.loading_content_span = Some(trace_span!("load_meta_file_names"));
-
         let storage = Arc::clone(storage);
         let meta = StreamMetaStorage::load_from_ext(&storage, ext).await?;
         let shard = self.cfg.shard;
@@ -507,9 +479,32 @@ impl Execution {
         let mut cx = ExecuteCtx {
             storage: &storage,
             hooks: &mut hooks,
+            input_cache: None,
         };
 
         let guarded = async {
+            cx.input_cache = match &self.cfg.input_cache {
+                Some(cfg) if cfg.capacity.0 > 0 => {
+                    let cache = LocalObjectCache::new(cfg.dir.clone(), cfg.capacity.0).await?;
+                    tikv_util::info!(
+                        "Input cache enabled.";
+                        "dir" => %cache.dir().display(),
+                        "capacity" => cfg.capacity.0
+                    );
+                    Some(Arc::new(cache))
+                }
+                Some(cfg) => {
+                    tikv_util::warn!(
+                        "Input cache disabled due to zero capacity.";
+                        "dir" => %cfg.dir.display(),
+                        "capacity" => cfg.capacity.0
+                    );
+                    None
+                }
+                None => None,
+            };
+            let input_cache = cx.input_cache.clone();
+
             let all_works = self.run_prepared(&mut cx);
             let res = tokio::select! {
                 res = all_works => res,
@@ -523,6 +518,16 @@ impl Execution {
                         err,
                     })
                     .await
+            }
+
+            if let Some(cache) = input_cache {
+                if let Err(err) = cache.shutdown().await {
+                    tikv_util::warn!(
+                        "failed to cleanup input cache run directory";
+                        "dir" => %cache.dir().display(),
+                        "err" => %err
+                    );
+                }
             }
 
             res
