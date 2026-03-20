@@ -23,7 +23,6 @@ use super::{EpochHint, Subcompaction, SubcompactionResult};
 use crate::{
     compaction::SST_OUT_REL,
     errors::{OtherErrExt, Result, TraceResultExt},
-    input_cache::LocalObjectCache,
     source::{Record, Source},
     statistic::{LoadStatistic, SubcompactStatistic, prom::*},
     storage::DEFAULT_COMPACTION_OUT_PREFIX,
@@ -74,20 +73,13 @@ pub struct SubcompactionExecArg<DB> {
     pub db: Option<DB>,
     /// The output storage.
     pub storage: Arc<dyn ExternalStorage>,
-    /// Optional per-execution local cache for input objects.
-    pub input_cache: Option<Arc<LocalObjectCache>>,
 }
 
 impl<DB> From<SubcompactionExecArg<DB>> for SubcompactionExec<DB> {
     fn from(value: SubcompactionExecArg<DB>) -> Self {
-        let output = value.storage;
-        let source = match value.input_cache {
-            Some(cache) => Source::with_cache(Arc::clone(&output), cache),
-            None => Source::new(Arc::clone(&output)),
-        };
         Self {
-            source,
-            output,
+            source: Source::new(Arc::clone(&value.storage)),
+            output: value.storage,
             out_prefix: value
                 .out_prefix
                 .unwrap_or_else(|| Path::new(DEFAULT_COMPACTION_OUT_PREFIX).to_owned()),
@@ -107,7 +99,6 @@ impl SubcompactionExec<RocksEngine> {
             storage,
             out_prefix: None,
             db: None,
-            input_cache: None,
         })
     }
 }

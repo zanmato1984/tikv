@@ -4,12 +4,7 @@ pub mod hooking;
 #[cfg(test)]
 mod test;
 
-use std::{
-    borrow::Cow,
-    cell::Cell,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{borrow::Cow, cell::Cell, path::Path, str::FromStr, sync::Arc};
 
 use chrono::Utc;
 use engine_rocks::RocksEngine;
@@ -26,8 +21,7 @@ use tokio::{
     runtime::Handle,
     task::{JoinError, JoinHandle},
 };
-use tokio_util::either::Either;
-use tracing::{Instrument, trace_span};
+use tracing::trace_span;
 use tracing_active_tree::{frame, root};
 use txn_types::TimeStamp;
 
@@ -44,7 +38,6 @@ use crate::{
     compaction::{SubcompactionResult, exec::SubcompactionExecArg},
     errors::{Result, TraceResultExt},
     execute::hooking::SubcompactionSkippedCtx,
-    input_cache::LocalObjectCache,
     util,
 };
 
@@ -158,12 +151,6 @@ impl FromStr for ShardConfigArg {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct InputCacheConfig {
-    pub dir: PathBuf,
-    pub capacity: ReadableSize,
-}
-
 /// The config for an execution of a compaction.
 ///
 /// This structure itself fully defines what work the compaction need to do.
@@ -189,9 +176,6 @@ pub struct ExecutionConfig {
     ///
     /// If `None`, we will use the default level of the selected algorithm.
     pub compression_level: Option<i32>,
-
-    /// Optional per-execution local cache for input objects.
-    pub input_cache: Option<InputCacheConfig>,
 }
 
 impl slog::KV for ExecutionConfig {
@@ -221,10 +205,6 @@ impl slog::KV for ExecutionConfig {
         serializer.emit_arguments("compression", &format_args!("{:?}", self.compression))?;
         if let Some(level) = self.compression_level {
             serializer.emit_i32("compression.level", level)?;
-        }
-        if let Some(cache) = &self.input_cache {
-            serializer.emit_str("input_cache.dir", &cache.dir.to_string_lossy())?;
-            serializer.emit_u64("input_cache.capacity", cache.capacity.0)?;
         }
 
         Ok(())
@@ -284,7 +264,6 @@ pub struct Execution<DB: SstExt = RocksEngine> {
 struct ExecuteCtx<'a, H: ExecHooks> {
     storage: &'a Arc<dyn ExternalStorage + 'static>,
     hooks: &'a mut H,
-    input_cache: Option<Arc<LocalObjectCache>>,
 }
 
 impl Execution {
@@ -323,11 +302,9 @@ impl Execution {
 
     async fn run_prepared(&self, cx: &mut ExecuteCtx<'_, impl ExecHooks>) -> Result<()> {
         let mut ext = LoadFromExt::default();
-        ext.loading_content_span = Some(trace_span!("load_meta_file_names"));
         ext.prefetch_running_count = self.cfg.prefetch_running_count as usize;
         ext.prefetch_buffer_count = self.cfg.prefetch_buffer_count as usize;
 
-        let input_cache = cx.input_cache.clone();
         let ExecuteCtx {
             ref storage,
             ref mut hooks,
@@ -340,6 +317,12 @@ impl Execution {
             this: self,
         };
         hooks.before_execution_started(cx).await?;
+
+        // Avoid setting an explicit parent here: this span may be dropped while
+        // the parent span is not currently entered (e.g. early-abort paths),
+        // which can violate invariants of `tracing-active-tree`.
+        ext.loading_content_span = Some(trace_span!("load_meta_file_names"));
+
         let storage = Arc::clone(storage);
         let meta = StreamMetaStorage::load_from_ext(&storage, ext).await?;
         let shard = self.cfg.shard;
@@ -398,7 +381,6 @@ impl Execution {
                 out_prefix: Some(Path::new(&self.out_prefix).to_owned()),
                 db: self.db.clone(),
                 storage: Arc::clone(&storage),
-                input_cache: input_cache.clone(),
             };
             let compact_worker = SubcompactionExec::from(compact_args);
             let mut ext = SubcompactExt::default();
@@ -479,32 +461,9 @@ impl Execution {
         let mut cx = ExecuteCtx {
             storage: &storage,
             hooks: &mut hooks,
-            input_cache: None,
         };
 
         let guarded = async {
-            cx.input_cache = match &self.cfg.input_cache {
-                Some(cfg) if cfg.capacity.0 > 0 => {
-                    let cache = LocalObjectCache::new(cfg.dir.clone(), cfg.capacity.0).await?;
-                    tikv_util::info!(
-                        "Input cache enabled.";
-                        "dir" => %cache.dir().display(),
-                        "capacity" => cfg.capacity.0
-                    );
-                    Some(Arc::new(cache))
-                }
-                Some(cfg) => {
-                    tikv_util::warn!(
-                        "Input cache disabled due to zero capacity.";
-                        "dir" => %cfg.dir.display(),
-                        "capacity" => cfg.capacity.0
-                    );
-                    None
-                }
-                None => None,
-            };
-            let input_cache = cx.input_cache.clone();
-
             let all_works = self.run_prepared(&mut cx);
             let res = tokio::select! {
                 res = all_works => res,
@@ -518,16 +477,6 @@ impl Execution {
                         err,
                     })
                     .await
-            }
-
-            if let Some(cache) = input_cache {
-                if let Err(err) = cache.shutdown().await {
-                    tikv_util::warn!(
-                        "failed to cleanup input cache run directory";
-                        "dir" => %cache.dir().display(),
-                        "err" => %err
-                    );
-                }
             }
 
             res
