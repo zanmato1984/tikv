@@ -433,7 +433,7 @@ fn main() {
                 }
             };
             let ccfg = compact_log::ExecutionConfig {
-                shard: shard.map(|v| v.0),
+                shard,
                 from_ts,
                 until_ts,
                 prefetch_running_count,

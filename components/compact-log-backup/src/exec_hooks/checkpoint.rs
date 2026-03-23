@@ -3,8 +3,7 @@
 use std::{collections::HashSet, os::unix::ffi::OsStrExt, path::Path};
 
 use external_storage::ExternalStorage;
-use futures::io::AsyncReadExt;
-use futures::stream::TryStreamExt;
+use futures::{io::AsyncReadExt, stream::TryStreamExt};
 use kvproto::brpb;
 use protobuf::{ProtobufEnum, parse_from_bytes};
 use tikv_util::{info, time::Instant, warn};
@@ -82,10 +81,7 @@ impl Checkpoint {
         Ok(Some(u64::from_be_bytes(hash_bytes)))
     }
 
-    async fn load_hashes_from_cmeta(
-        storage: &dyn ExternalStorage,
-        key: &str,
-    ) -> Result<Vec<u64>> {
+    async fn load_hashes_from_cmeta(storage: &dyn ExternalStorage, key: &str) -> Result<Vec<u64>> {
         let mut content = vec![];
         storage
             .read(key)
@@ -161,8 +157,10 @@ mod tests {
     use kvproto::brpb;
 
     use super::Checkpoint;
-    use crate::compaction::{Input, Subcompaction, SubcompactionCollectKey};
-    use crate::storage::LogFileId;
+    use crate::{
+        compaction::{Input, Subcompaction, SubcompactionCollectKey},
+        storage::LogFileId,
+    };
 
     #[test]
     fn test_checkpoint_hash_matches_subcompaction_hash() {

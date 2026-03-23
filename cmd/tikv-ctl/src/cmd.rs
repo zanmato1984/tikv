@@ -3,7 +3,7 @@
 use std::{borrow::ToOwned, str, string::ToString, sync::LazyLock};
 
 use clap::{AppSettings, crate_authors};
-use compact_log_backup::ShardConfigArg;
+use compact_log_backup::ShardConfig;
 use engine_traits::{CF_DEFAULT, SstCompressionType};
 use raft_engine::ReadableSize;
 use structopt::StructOpt;
@@ -655,7 +655,7 @@ pub enum Cmd {
                 where INDEX is 1-based (e.g. 1/3)."
             )
         )]
-        shard: Option<ShardConfigArg>,
+        shard: Option<ShardConfig>,
         #[structopt(
             long = "from",
             help(

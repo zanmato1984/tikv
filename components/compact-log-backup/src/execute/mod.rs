@@ -127,27 +127,11 @@ pub fn parse_shard_config(s: &str) -> std::result::Result<ShardConfig, ShardConf
     Ok(ShardConfig::new(index, total)?)
 }
 
-/// A CLI-facing wrapper for parsing `ShardConfig`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShardConfigArg(pub ShardConfig);
-
-impl ShardConfigArg {
-    pub fn into_inner(self) -> ShardConfig {
-        self.0
-    }
-}
-
-impl From<ShardConfigArg> for ShardConfig {
-    fn from(value: ShardConfigArg) -> Self {
-        value.0
-    }
-}
-
-impl FromStr for ShardConfigArg {
+impl FromStr for ShardConfig {
     type Err = ShardConfigParseError;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        parse_shard_config(s).map(Self)
+        parse_shard_config(s)
     }
 }
 
