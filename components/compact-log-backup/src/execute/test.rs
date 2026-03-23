@@ -103,8 +103,19 @@ fn gen_store_builders(store_id: u64) -> Vec<LogFileBuilder> {
 async fn populate_stores(st: &TmpStorage, stores: RangeInclusive<u64>) -> HashMap<String, u64> {
     let mut meta_path_to_store_id = HashMap::<String, u64>::new();
     for store_id in stores {
-        let meta_path = format!("v1/backupmeta/store_{store_id}.meta");
-        let log_path = format!("store_{store_id}.log");
+        let base_ts = store_id * 1_000;
+        let meta_path = format!(
+            "v1/backupmeta/{:016X}{:016X}-d{:016X}l{:016X}u{:016X}.meta",
+            base_ts + 300,
+            store_id,
+            base_ts + 100,
+            base_ts + 100,
+            base_ts + 300,
+        );
+        let log_path = format!(
+            "v1/20260320/12/{store_id}/{}-00000000-0000-0000-0000-000000000042.log",
+            base_ts + 100
+        );
         st.build_flush_with_store_id(
             store_id,
             &log_path,

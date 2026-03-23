@@ -329,7 +329,7 @@ impl Execution {
         let stream = meta.flat_map(move |file| match file {
             Ok(file) => {
                 let meta_name = Arc::clone(&file.name);
-                let store_id = file.store_id;
+                let store_id = file.resolved_store_id();
                 let logs = file
                     .into_logs()
                     .filter(move |_| shard.map_or(true, |s| s.contains(store_id, &meta_name)));
