@@ -101,13 +101,12 @@ ignore = [
     # RUSTSEC-2026-0002 (Stacked Borrows UB). Upstream dependency
     # constraints prevent upgrading at the moment.
     "RUSTSEC-2026-0002",
-    # bytes 1.7.2 triggers RUSTSEC-2026-0007. Upgrading the transitive
-    # dependency chain is out of scope for this release-8.5 backport, so
-    # ignore it temporarily until the release branch picks a centralized fix.
+    # bytes can be upgraded in isolation, but we are temporarily ignoring
+    # this advisory until we refresh the lockfile in a dedicated dependency
+    # update.
     "RUSTSEC-2026-0007",
-    # time >=0.3.47 fixes RUSTSEC-2026-0009, but upgrading from 0.3.41
-    # currently conflicts with raft-engine's pinned serde (=1.0.194).
-    # We will remove this once raft-engine / serde constraints are relaxed.
+    # azure depends on time 0.3.x, but upgrading to a fixed version is
+    # currently blocked by raft-engine pinning serde to =1.0.194.
     "RUSTSEC-2026-0009",
 ]
 

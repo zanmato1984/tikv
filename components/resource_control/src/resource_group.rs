@@ -27,7 +27,10 @@ use tikv_util::{
 };
 use yatp::queue::priority::TaskPriorityProvider;
 
-use crate::{config::Config, metrics::deregister_metrics, resource_limiter::ResourceLimiter};
+use crate::{
+    config::Config, cpu_config::CpuThrottleConfig, metrics::deregister_metrics,
+    resource_limiter::ResourceLimiter, CpuThrottleManager,
+};
 
 // a read task cost at least 50us.
 const DEFAULT_PRIORITY_PER_READ_TASK: u64 = 50;
@@ -39,6 +42,7 @@ pub const MIN_PRIORITY_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_RU_QUOTA: u64 = 10_000;
 /// The maximum RU quota that can be configured.
 const MAX_RU_QUOTA: u64 = i32::MAX as u64;
+type ResourceGroupSettingSnapshot = (&'static str, u64, u64);
 
 #[cfg(test)]
 const LOW_PRIORITY: u32 = 1;
@@ -69,6 +73,7 @@ pub struct ResourceGroupManager {
     priority_limiters: [Arc<ResourceLimiter>; TaskPriority::PRIORITY_COUNT],
     // lastest config.
     config: Arc<VersionTrack<Config>>,
+    cpu_throttle: RwLock<Option<Arc<CpuThrottleManager>>>,
 }
 
 impl Default for ResourceGroupManager {
@@ -95,6 +100,7 @@ impl ResourceGroupManager {
             version_generator: AtomicU64::new(0),
             priority_limiters,
             config: Arc::new(VersionTrack::new(config)),
+            cpu_throttle: RwLock::new(None),
         };
 
         // init the default resource group by default.
@@ -117,7 +123,7 @@ impl ResourceGroupManager {
         self.group_count.load(Ordering::Relaxed)
     }
 
-    fn get_ru_setting(rg: &PbResourceGroup, is_read: bool) -> u64 {
+    pub(crate) fn get_ru_setting(rg: &PbResourceGroup, is_read: bool) -> u64 {
         match (rg.get_mode(), is_read) {
             // RU mode, read and write use the same setting.
             (GroupMode::RuMode, _) => rg
@@ -142,26 +148,87 @@ impl ResourceGroupManager {
         }
     }
 
+    fn snapshot_group_settings(rg: &PbResourceGroup) -> ResourceGroupSettingSnapshot {
+        match rg.get_mode() {
+            GroupMode::RuMode => {
+                let fill_rate = rg
+                    .get_r_u_settings()
+                    .get_r_u()
+                    .get_settings()
+                    .get_fill_rate();
+                ("ru", fill_rate, fill_rate)
+            }
+            GroupMode::RawMode => (
+                "raw",
+                rg.get_raw_resource_settings()
+                    .get_cpu()
+                    .get_settings()
+                    .get_fill_rate(),
+                rg.get_raw_resource_settings()
+                    .get_io_write()
+                    .get_settings()
+                    .get_fill_rate(),
+            ),
+            GroupMode::Unknown => ("unknown", 0, 0),
+        }
+    }
+
     pub fn add_resource_group(&self, rg: PbResourceGroup) {
         let group_name = rg.get_name().to_ascii_lowercase();
+        let cpu_ru_quota = Self::get_ru_setting(&rg, true);
+        let current_settings = Self::snapshot_group_settings(&rg);
+        let previous_settings = self
+            .resource_groups
+            .get(&group_name)
+            .map(|group| Self::snapshot_group_settings(&group.group));
         self.registry.read().iter().for_each(|controller| {
             let ru_quota = Self::get_ru_setting(&rg, controller.is_read);
             controller.add_resource_group(group_name.clone().into_bytes(), ru_quota, rg.priority);
         });
-        info!("add resource group"; "name"=> &rg.name, "ru" => rg.get_r_u_settings().get_r_u().get_settings().get_fill_rate());
+        match previous_settings {
+            Some((prev_mode, prev_read_fill_rate, prev_write_fill_rate))
+                if (prev_mode, prev_read_fill_rate, prev_write_fill_rate) != current_settings =>
+            {
+                let (mode, read_fill_rate, write_fill_rate) = current_settings;
+                info!(
+                    "[CPU throttle] update resource group ru settings";
+                    "name" => &rg.name,
+                    "mode" => mode,
+                    "previous_mode" => prev_mode,
+                    "previous_read_fill_rate" => prev_read_fill_rate,
+                    "new_read_fill_rate" => read_fill_rate,
+                    "previous_write_fill_rate" => prev_write_fill_rate,
+                    "new_write_fill_rate" => write_fill_rate,
+                );
+            }
+            None => {
+                let (mode, read_fill_rate, write_fill_rate) = current_settings;
+                info!(
+                    "[CPU throttle] add resource group";
+                    "name" => &rg.name,
+                    "mode" => mode,
+                    "read_fill_rate" => read_fill_rate,
+                    "write_fill_rate" => write_fill_rate,
+                );
+            }
+            _ => {}
+        }
         // try to reuse the quota limit when update resource group settings.
         let prev_limiter = self
             .resource_groups
-            .get(&rg.name)
+            .get(&group_name)
             .and_then(|g| g.limiter.clone());
         let limiter = self.build_resource_limiter(&rg, prev_limiter);
 
         if self
             .resource_groups
-            .insert(group_name, ResourceGroup::new(rg, limiter))
+            .insert(group_name.clone(), ResourceGroup::new(rg, limiter))
             .is_none()
         {
             self.group_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(ref mgr) = *self.cpu_throttle.read() {
+            mgr.on_resource_group_changed(&group_name, cpu_ru_quota);
         }
     }
 
@@ -195,6 +262,9 @@ impl ResourceGroupManager {
             deregister_metrics(name);
             info!("remove resource group"; "name"=> name);
             self.group_count.fetch_sub(1, Ordering::Relaxed);
+            if let Some(ref mgr) = *self.cpu_throttle.read() {
+                mgr.on_resource_group_removed(&group_name);
+            }
         }
     }
 
@@ -220,6 +290,11 @@ impl ResourceGroupManager {
             });
             self.group_count
                 .fetch_sub(removed_names.len() as u64, Ordering::Relaxed);
+            if let Some(ref mgr) = *self.cpu_throttle.read() {
+                for name in &removed_names {
+                    mgr.on_resource_group_removed(name);
+                }
+            }
         }
     }
 
@@ -229,6 +304,22 @@ impl ResourceGroupManager {
 
     pub fn get_config(&self) -> &Arc<VersionTrack<Config>> {
         &self.config
+    }
+
+    pub fn get_cpu_throttle_manager(&self) -> Option<Arc<CpuThrottleManager>> {
+        self.cpu_throttle.read().clone()
+    }
+
+    pub fn set_cpu_throttle_manager(&self, mgr: Arc<CpuThrottleManager>) {
+        *self.cpu_throttle.write() = Some(mgr.clone());
+        mgr.sync_resource_groups(self.collect_cpu_throttle_resource_groups());
+    }
+
+    pub fn refresh_cpu_throttle_config(&self, config: CpuThrottleConfig) {
+        if let Some(ref mgr) = *self.cpu_throttle.read() {
+            mgr.refresh_config(config);
+            mgr.sync_resource_groups(self.collect_cpu_throttle_resource_groups());
+        }
     }
 
     pub fn get_all_resource_groups(&self) -> Vec<PbResourceGroup> {
@@ -246,6 +337,18 @@ impl ResourceGroupManager {
             controller.add_resource_group(g.key().clone().into_bytes(), ru_quota, g.group.priority);
         }
         controller
+    }
+
+    fn collect_cpu_throttle_resource_groups(&self) -> Vec<(String, u64)> {
+        self.resource_groups
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    Self::get_ru_setting(&entry.value().group, true),
+                )
+            })
+            .collect()
     }
 
     pub fn advance_min_virtual_time(&self) {
